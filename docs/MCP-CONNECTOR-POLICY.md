@@ -30,6 +30,19 @@ The default set stays well under ten. In practice the 2026 field default across 
 
 All six remain available as opt-in entries in `mcp-configs/mcp-servers.json` for users who want them.
 
+## Version pinning
+
+Every bundled server that is fetched from a registry at launch names an exact
+version — no `@latest`, no bare package name (npx resolves that to latest too).
+A floating spec means an unreviewed upstream release executes on the user's
+machine on the next launch, with whatever tokens and filesystem access that
+server was granted. This covers the default connector in `.mcp.json`, all
+`npx`/`uvx` entries in `mcp-configs/mcp-servers.json`, and the Codex mirror in
+`scripts/codex/merge-mcp-config.js`.
+
+`tests/mcp-version-pinning.test.js` enforces this. Bumping a pin is a normal PR:
+state the version being adopted and what changed upstream.
+
 ## Opt-out
 
 `ECC_DISABLED_MCPS` filters ECC-generated MCP configs at install/sync time:
