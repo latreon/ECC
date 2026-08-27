@@ -39,6 +39,25 @@ const FAILURE_PATTERNS = [
   { code: 'transport', pattern: /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|timed? out|socket hang up|connection (?:failed|lost|reset|closed)/i }
 ];
 
+// cmd.exe treats these as operators, grouping syntax, expansion markers,
+// separators, or argument boundaries. Command strings containing them must not
+// be routed through shell mode.
+const WINDOWS_UNSAFE_SHELL_CHARS = /[&|<>^%!()\s;]/;
+
+// When spawning via cmd.exe (shell:true) on Windows, Node concatenates
+// command + args WITHOUT quoting (DEP0190). An arg containing a space — such as
+// a path under "C:\Program Files" — gets re-split by cmd.exe. Quote each token
+// and pass the whole line as a single string so cmd.exe sees one unit per token.
+function quoteWindowsToken(token) {
+  // If the token has no characters that need quoting, return it as-is.
+  if (!/[\s"&|<>^%!();]/.test(token)) {
+    return token;
+  }
+  // Escape embedded double quotes by doubling them, then wrap in double quotes.
+  // cmd.exe uses "" as an escaped quote inside a quoted string.
+  return '"' + token.replace(/"/g, '""') + '"';
+}
+
 function envNumber(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -333,26 +352,6 @@ function probeCommandServer(serverName, config) {
         ? [command, `${command}.cmd`, `${command}.exe`, `${command}.bat`]
         : [command];
 
-    // cmd.exe treats these as operators, grouping syntax, expansion markers,
-    // separators, or argument boundaries. Do not route such command strings
-    // through shell mode.
-    const UNSAFE_SHELL_CHARS = /[&|<>^%!()\s;]/;
-
-    // When spawning via cmd.exe (shell:true) on Windows, Node concatenates
-    // command + args WITHOUT quoting (DEP0190). An arg containing a space —
-    // such as a path under "C:\Program Files" — gets re-split by cmd.exe.
-    // Build a properly-quoted command line instead and pass it as a single
-    // string with no args array, so cmd.exe sees each token as one unit.
-    function quoteWin(token) {
-      // If the token has no characters that need quoting, return it as-is.
-      if (!/[\s"&|<>^%!();]/.test(token)) {
-        return token;
-      }
-      // Escape embedded double quotes by doubling them, then wrap in double
-      // quotes. cmd.exe uses "" as an escaped quote inside a quoted string.
-      return '"' + token.replace(/"/g, '""') + '"';
-    }
-
     function attempt(idx) {
       const tryCommand = candidates[idx];
       const isLast = idx + 1 >= candidates.length;
@@ -386,7 +385,7 @@ function probeCommandServer(serverName, config) {
       const useShell = process.platform === 'win32'
         && typeof tryCommand === 'string'
         && /\.(cmd|bat)$/i.test(tryCommand)
-        && !UNSAFE_SHELL_CHARS.test(tryCommand);
+        && !WINDOWS_UNSAFE_SHELL_CHARS.test(tryCommand);
 
       let child;
       try {
@@ -395,7 +394,7 @@ function probeCommandServer(serverName, config) {
           // array with shell:true causes Node to concatenate without quoting
           // (DEP0190), which splits space-containing args (e.g. paths under
           // "C:\Program Files") at every space boundary.
-          const quotedCmdline = [tryCommand, ...args].map(quoteWin).join(' ');
+          const quotedCmdline = [tryCommand, ...args].map(quoteWindowsToken).join(' ');
           child = spawn(quotedCmdline, {
             env: mergedEnv,
             cwd: process.cwd(),
@@ -542,31 +541,154 @@ async function probeServer(serverName, resolvedConfig) {
   };
 }
 
-function reconnectCommand(serverName) {
-  const key = `ECC_MCP_RECONNECT_${String(serverName).toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
-  const command = process.env[key] || process.env.ECC_MCP_RECONNECT_COMMAND || '';
-  if (!command.trim()) {
+// MCP server identifiers reach this hook from attacker-influenced tool input
+// (the `mcp__<server>__<tool>` segments and `tool_input.server`). Only names
+// that could plausibly be a real server key are ever interpolated into a
+// reconnect argv.
+const SAFE_SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+function isSafeServerName(serverName) {
+  return SAFE_SERVER_NAME.test(String(serverName));
+}
+
+/**
+ * Split a configured reconnect command string into an argv array.
+ *
+ * Understands single quotes, double quotes and backslash escapes so existing
+ * quoted-path configurations keep working. Shell metacharacters carry no
+ * special meaning here: the argv is spawned with shell:false, so `;`, `&&`,
+ * backticks and `$(...)` stay literal argument text.
+ *
+ * Returns null for an unterminated quote rather than guessing.
+ */
+function tokenizeCommand(command) {
+  const tokens = [];
+  let current = '';
+  let hasCurrent = false;
+  let quote = null;
+
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
+
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (quote === '"') {
+      if (char === '\\' && i + 1 < command.length && /["\\]/.test(command[i + 1])) {
+        i += 1;
+        current += command[i];
+      } else if (char === '"') {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      quote = char;
+      hasCurrent = true;
+      continue;
+    }
+
+    if (char === '\\' && i + 1 < command.length) {
+      i += 1;
+      current += command[i];
+      hasCurrent = true;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (hasCurrent) {
+        tokens.push(current);
+        current = '';
+        hasCurrent = false;
+      }
+      continue;
+    }
+
+    current += char;
+    hasCurrent = true;
+  }
+
+  if (quote) {
     return null;
   }
 
-  return command.includes('{server}')
-    ? command.replace(/\{server\}/g, serverName)
-    : command;
+  if (hasCurrent) {
+    tokens.push(current);
+  }
+
+  return tokens;
+}
+
+function reconnectArgv(serverName) {
+  const key = `ECC_MCP_RECONNECT_${String(serverName).toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+  const command = process.env[key] || process.env.ECC_MCP_RECONNECT_COMMAND || '';
+  if (!command.trim()) {
+    return { argv: null, reason: 'no reconnect command configured' };
+  }
+
+  const tokens = tokenizeCommand(command);
+  if (!tokens || tokens.length === 0) {
+    return { argv: null, reason: 'reconnect command could not be parsed into an argv' };
+  }
+
+  if (!tokens.some(token => token.includes('{server}'))) {
+    return { argv: tokens, reason: null };
+  }
+
+  if (!isSafeServerName(serverName)) {
+    return {
+      argv: null,
+      reason: `refused {server} expansion: unsafe server name ${JSON.stringify(String(serverName))}`
+    };
+  }
+
+  return {
+    argv: tokens.map(token => token.split('{server}').join(String(serverName))),
+    reason: null
+  };
 }
 
 function attemptReconnect(serverName) {
-  const command = reconnectCommand(serverName);
-  if (!command) {
-    return { attempted: false, success: false, reason: 'no reconnect command configured' };
+  const { argv, reason: rejection } = reconnectArgv(serverName);
+  if (!argv) {
+    return { attempted: false, success: false, reason: rejection };
   }
 
-  const result = spawnSync(command, {
-    shell: true,
+  const [file, ...args] = argv;
+  const options = {
     env: process.env,
     cwd: process.cwd(),
     encoding: 'utf8',
     timeout: envNumber('ECC_MCP_RECONNECT_TIMEOUT_MS', DEFAULT_TIMEOUT_MS)
-  });
+  };
+
+  // Node refuses to spawn .cmd/.bat directly on Windows (CVE-2024-27980).
+  // Those go through cmd.exe as a fully quoted command line, and only when
+  // every token is free of characters cmd.exe would reinterpret.
+  const needsWindowsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(file);
+  let result;
+
+  if (needsWindowsShell) {
+    if (argv.some(token => WINDOWS_UNSAFE_SHELL_CHARS.test(token))) {
+      return {
+        attempted: false,
+        success: false,
+        reason: 'reconnect command contains characters cmd.exe would reinterpret'
+      };
+    }
+    result = spawnSync(argv.map(quoteWindowsToken).join(' '), { ...options, shell: true });
+  } else {
+    result = spawnSync(file, args, { ...options, shell: false });
+  }
 
   if (result.error) {
     return { attempted: true, success: false, reason: result.error.message };

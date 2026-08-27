@@ -1192,6 +1192,99 @@ async function runTests() {
     console.log('  - skipped: windows: .cmd probe preserves space-containing args as single tokens (non-Windows)');
   }
 
+  if (test('refuses to expand shell metacharacters from an attacker-supplied server name', () => {
+    const tempDir = createTempDir();
+    const statePath = path.join(tempDir, 'mcp-health.json');
+    const reconnectScript = path.join(tempDir, 'server-reconnect.js');
+    const markerFile = path.join(tempDir, 'server-name.txt');
+    const injectedFile = path.join(tempDir, 'pwned.txt');
+
+    try {
+      fs.writeFileSync(
+        reconnectScript,
+        [
+          "const fs = require('fs');",
+          "fs.writeFileSync(process.argv[2], process.argv[3]);"
+        ].join('\n')
+      );
+
+      const result = runHook(
+        {
+          tool_name: 'mcp__evil__messages',
+          tool_input: {
+            server: `evil; ${JSON.stringify(process.execPath)} -e ${JSON.stringify(`require('fs').writeFileSync(${JSON.stringify(injectedFile)}, 'pwned')`)}`
+          },
+          message: 'transport connection reset'
+        },
+        {
+          CLAUDE_HOOK_EVENT_NAME: 'PostToolUseFailure',
+          ECC_MCP_HEALTH_STATE_PATH: statePath,
+          ECC_MCP_CONFIG_PATH: path.join(tempDir, 'missing.json'),
+          ECC_MCP_RECONNECT_COMMAND: `${JSON.stringify(process.execPath)} ${JSON.stringify(reconnectScript)} ${JSON.stringify(markerFile)} {server}`
+        }
+      );
+
+      assert.strictEqual(result.code, 0, 'Expected reconnect hook to remain non-blocking');
+      assert.ok(
+        !fs.existsSync(injectedFile),
+        'Server name metacharacters were executed as a shell command'
+      );
+      assert.ok(
+        !fs.existsSync(markerFile),
+        'Expected unsafe server name to be rejected before the reconnect command ran'
+      );
+      assert.ok(
+        result.stderr.includes('unsafe server name'),
+        `Expected unsafe server name rejection, got: ${result.stderr}`
+      );
+    } finally {
+      cleanupTempDir(tempDir);
+    }
+  })) passed++; else failed++;
+
+  if (test('runs reconnect commands without a shell so metacharacters stay literal', () => {
+    const tempDir = createTempDir();
+    const statePath = path.join(tempDir, 'mcp-health.json');
+    const reconnectScript = path.join(tempDir, 'literal-reconnect.js');
+    const markerFile = path.join(tempDir, 'literal.txt');
+    const injectedFile = path.join(tempDir, 'shell-ran.txt');
+    const literalArg = `;touch ${injectedFile}`;
+
+    try {
+      fs.writeFileSync(
+        reconnectScript,
+        [
+          "const fs = require('fs');",
+          "fs.writeFileSync(process.argv[2], process.argv.slice(3).join('|'));"
+        ].join('\n')
+      );
+
+      const result = runHook(
+        {
+          tool_name: 'mcp__literal__messages',
+          tool_input: {},
+          message: 'transport connection reset'
+        },
+        {
+          CLAUDE_HOOK_EVENT_NAME: 'PostToolUseFailure',
+          ECC_MCP_HEALTH_STATE_PATH: statePath,
+          ECC_MCP_CONFIG_PATH: path.join(tempDir, 'missing.json'),
+          ECC_MCP_RECONNECT_COMMAND: `${JSON.stringify(process.execPath)} ${JSON.stringify(reconnectScript)} ${JSON.stringify(markerFile)} ${JSON.stringify(literalArg)}`
+        }
+      );
+
+      assert.strictEqual(result.code, 0, 'Expected reconnect hook to remain non-blocking');
+      assert.ok(!fs.existsSync(injectedFile), 'Reconnect command was interpreted by a shell');
+      assert.strictEqual(
+        fs.readFileSync(markerFile, 'utf8'),
+        literalArg,
+        'Expected the metacharacter argument to reach the child process verbatim'
+      );
+    } finally {
+      cleanupTempDir(tempDir);
+    }
+  })) passed++; else failed++;
+
   console.log(`\nResults: Passed: ${passed}, Failed: ${failed}`);
   process.exit(failed > 0 ? 1 : 0);
 }
