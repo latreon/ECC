@@ -111,6 +111,56 @@ function sendHtml(res, statusCode, html, { csp = true } = {}) {
   res.end(html);
 }
 
+/**
+ * Resolve a sibling asset request to a real file inside the artifact directory.
+ *
+ * Lexical containment is not enough: a symlink that lives inside the artifact
+ * directory can point anywhere on disk, so both the directory and the
+ * candidate are canonicalised before the prefix check, and only regular files
+ * are ever served. Directories, sockets, FIFOs and device nodes are refused.
+ *
+ * Returns { ok: true, filePath } or { ok: false, status, error }.
+ */
+function resolveArtifactAsset(baseDir, assetPath) {
+  let realBase;
+  try {
+    realBase = fs.realpathSync(baseDir);
+  } catch {
+    return { ok: false, status: 404, error: 'asset not found' };
+  }
+
+  const candidate = path.resolve(realBase, assetPath);
+  if (candidate !== realBase && !candidate.startsWith(realBase + path.sep)) {
+    return { ok: false, status: 403, error: 'asset path escapes artifact directory' };
+  }
+
+  let realPath;
+  try {
+    realPath = fs.realpathSync(candidate);
+  } catch {
+    return { ok: false, status: 404, error: 'asset not found' };
+  }
+
+  // realpath collapses every symlink on the way, so a link pointing outside
+  // the artifact directory fails this second check even though the lexical
+  // path above looked contained.
+  if (realPath !== realBase && !realPath.startsWith(realBase + path.sep)) {
+    return { ok: false, status: 403, error: 'asset path escapes artifact directory' };
+  }
+
+  let stats;
+  try {
+    stats = fs.statSync(realPath);
+  } catch {
+    return { ok: false, status: 404, error: 'asset not found' };
+  }
+  if (!stats.isFile()) {
+    return { ok: false, status: 403, error: 'asset is not a regular file' };
+  }
+
+  return { ok: true, filePath: realPath };
+}
+
 function createPlanCanvasServer({
   store,
   host = DEFAULT_HOST,
@@ -512,18 +562,17 @@ function createPlanCanvasServer({
 
     // Sibling assets resolve relative to the artifact's directory and must
     // stay confined to it.
-    const baseDir = path.dirname(session.file);
-    const resolved = path.resolve(baseDir, assetPath);
-    if (resolved !== baseDir && !resolved.startsWith(baseDir + path.sep)) {
-      return sendJson(res, 403, { error: 'asset path escapes artifact directory' });
+    const asset = resolveArtifactAsset(path.dirname(session.file), assetPath);
+    if (!asset.ok) {
+      return sendJson(res, asset.status, { error: asset.error });
     }
     let data;
     try {
-      data = fs.readFileSync(resolved);
+      data = fs.readFileSync(asset.filePath);
     } catch {
       return sendJson(res, 404, { error: 'asset not found' });
     }
-    const type = CONTENT_TYPES[path.extname(resolved).toLowerCase()] || 'application/octet-stream';
+    const type = CONTENT_TYPES[path.extname(asset.filePath).toLowerCase()] || 'application/octet-stream';
     res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
     return res.end(data);
   }
@@ -629,6 +678,7 @@ module.exports = {
   DEFAULT_THINKING_STALE_MS,
   DEFAULT_TYPING_EXPIRY_MS,
   createPlanCanvasServer,
+  resolveArtifactAsset,
   resolveIdleTimeoutMs,
   resolvePort
 };
